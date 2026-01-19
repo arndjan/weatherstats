@@ -42,39 +42,84 @@ KNMI_STATIONS = {
 
 def insert_dataframe_to_mysql(df, table_name="knmi_minmaxtemp"):
     """
-    Inserts an entire Pandas DataFrame into a MySQL table.
+    Inserts or updates temperature data in MySQL table.
+    Uses ON DUPLICATE KEY UPDATE to handle existing records.
     """
     conn = None
     cursor = None
-    
+
     try:
-        # Connect to MySQL
         conn = mysql.connector.connect(**DB_CONFIG)
         cursor = conn.cursor()
 
-        # SQL INSERT statement
         sql = f"""
             INSERT INTO {table_name} (event_date, tmp_min, tmp_max, station)
-            VALUES (%s, %s, %s, %s);
+            VALUES (%s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                tmp_min = VALUES(tmp_min),
+                tmp_max = VALUES(tmp_max);
         """
 
-        # Convert DataFrame to list of tuples for batch insert
         values = [
             (row["date"], row["min_temp"], row["max_temp"], row["station"])
             for _, row in df.iterrows()
         ]
 
-        # Execute batch insert
         cursor.executemany(sql, values)
         conn.commit()
 
-        print(f"Inserted {cursor.rowcount} rows into {table_name}")
+        print(f"Synced {len(values)} rows to {table_name}")
 
     except mysql.connector.Error as err:
         print(f"Error: {err}")
 
     finally:
-        # Close cursor and connection only if they were successfully created
+        if cursor is not None:
+            cursor.close()
+        if conn is not None:
+            conn.close()
+
+def get_data_from_database(table_name="knmi_minmaxtemp"):
+    """
+    Fetch all temperature data from MySQL database, grouped by station.
+    Returns a dictionary with station_id as key and DataFrame as value.
+    """
+    conn = None
+    cursor = None
+
+    try:
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cursor = conn.cursor(dictionary=True)
+
+        sql = f"""
+            SELECT event_date as date, tmp_min as min_temp, tmp_max as max_temp, station
+            FROM {table_name}
+            ORDER BY station, event_date;
+        """
+
+        cursor.execute(sql)
+        rows = cursor.fetchall()
+
+        if not rows:
+            return {}
+
+        df = pd.DataFrame(rows)
+        df['date'] = pd.to_datetime(df['date'])
+
+        # Group by station
+        all_station_data = {}
+        for station_id in df['station'].unique():
+            station_df = df[df['station'] == station_id].copy()
+            station_df = station_df.reset_index(drop=True)
+            all_station_data[station_id] = station_df
+
+        return all_station_data
+
+    except mysql.connector.Error as err:
+        print(f"Error reading from database: {err}")
+        return {}
+
+    finally:
         if cursor is not None:
             cursor.close()
         if conn is not None:
@@ -154,29 +199,35 @@ def save_to_json(df, filename="temperature_data.json"):
     
     print(f"Data saved to {filename}")
 
-# Get last 90 days of data
+# Step 1: Fetch recent data from KNMI API and store in database
 end_date = datetime.now().strftime('%Y%m%d')
 start_date = (datetime.now() - timedelta(days=90)).strftime('%Y%m%d')
 
-# Fetch data for all stations
-print("Fetching data for all stations...")
-all_station_data = {}
+print("Fetching recent data from KNMI API...")
 for station_id, station_name in KNMI_STATIONS.items():
     print(f"  Fetching {station_name}...", end=" ")
     data = get_knmi_temperature_data(start_date, end_date, station_id)
     if data is not None:
-        all_station_data[station_id] = data
+        insert_dataframe_to_mysql(data)
         print("OK")
     else:
         print("No data")
 
+# Step 2: Load all data from database for visualization
+print("\nLoading data from database...")
+all_station_data = get_data_from_database()
+
+# Filter to only include known stations
+all_station_data = {k: v for k, v in all_station_data.items() if k in KNMI_STATIONS}
+
 if all_station_data:
-    # Save data for first station (Schiphol) as default
+    print(f"Loaded data for {len(all_station_data)} stations")
+
+    # Get date range from data
+    all_dates = pd.concat([df['date'] for df in all_station_data.values()])
+    print(f"Date range: {all_dates.min().strftime('%Y-%m-%d')} to {all_dates.max().strftime('%Y-%m-%d')}")
+
     default_station = 240
-    if default_station in all_station_data:
-        save_to_xml(all_station_data[default_station])
-        save_to_json(all_station_data[default_station])
-        insert_dataframe_to_mysql(all_station_data[default_station])
 
     # Create the visualization with dropdown
     fig = go.Figure()
@@ -191,11 +242,24 @@ if all_station_data:
         '#aec7e8', '#ffbb78'
     ]
 
-    # === SECTION 1: Individual station traces (2 per station) ===
+    # Day type definitions
+    day_types = [
+        {'name': 'Tropische dag', 'condition': lambda df: df['max_temp'] >= 30, 'color': '#8B0000', 'symbol': 'star', 'temp_col': 'max_temp'},
+        {'name': 'Zomerse dag', 'condition': lambda df: (df['max_temp'] >= 25) & (df['max_temp'] < 30), 'color': '#FF4500', 'symbol': 'diamond', 'temp_col': 'max_temp'},
+        {'name': 'Warme dag', 'condition': lambda df: (df['max_temp'] >= 20) & (df['max_temp'] < 25), 'color': '#FFA500', 'symbol': 'circle', 'temp_col': 'max_temp'},
+        {'name': 'Vorstdag', 'condition': lambda df: df['min_temp'] < 0, 'color': '#87CEEB', 'symbol': 'circle', 'temp_col': 'min_temp'},
+        {'name': 'IJsdag', 'condition': lambda df: df['max_temp'] < 0, 'color': '#00CED1', 'symbol': 'star', 'temp_col': 'max_temp'},
+    ]
+    num_day_types = len(day_types)
+
+    # === SECTION 1: Individual station traces (2 lines + 5 marker types per station) ===
+    traces_per_station = 2 + num_day_types  # max line, min line, + 5 day type markers
+
     for i, station_id in enumerate(station_ids):
         temp_data = all_station_data[station_id]
-        visible = (station_id == default_station)
+        visible = bool(station_id == default_station)
 
+        # Max temperature line
         fig.add_trace(go.Scatter(
             x=temp_data['date'],
             y=temp_data['max_temp'],
@@ -208,6 +272,7 @@ if all_station_data:
             showlegend=visible
         ))
 
+        # Min temperature line with fill
         fig.add_trace(go.Scatter(
             x=temp_data['date'],
             y=temp_data['min_temp'],
@@ -219,6 +284,28 @@ if all_station_data:
             legendgroup='individual',
             showlegend=visible
         ))
+
+        # Day type markers
+        for day_type in day_types:
+            mask = day_type['condition'](temp_data)
+            filtered = temp_data[mask]
+
+            fig.add_trace(go.Scatter(
+                x=filtered['date'],
+                y=filtered[day_type['temp_col']],
+                mode='markers',
+                marker=dict(
+                    color=day_type['color'],
+                    size=10,
+                    symbol=day_type['symbol'],
+                    line=dict(width=1, color='white')
+                ),
+                name=day_type['name'],
+                visible=visible,
+                legendgroup='daytypes',
+                showlegend=(visible and i == station_ids.index(default_station)),
+                hoverinfo='skip'
+            ))
 
     # === SECTION 2: Comparison traces - min temps ===
     for i, station_id in enumerate(station_ids):
@@ -250,13 +337,13 @@ if all_station_data:
             legendgroup='comparison_max'
         ))
 
-    # Total traces: (num_stations * 2) individual + num_stations min comparison + num_stations max comparison
-    num_individual_traces = num_stations * 2
+    # Total traces: individual (lines + markers) + comparison traces
+    num_individual_traces = num_stations * traces_per_station  # 7 traces per station (2 lines + 5 marker types)
     num_comparison_min_traces = num_stations
     num_comparison_max_traces = num_stations
     total_traces = num_individual_traces + num_comparison_min_traces + num_comparison_max_traces
 
-    # Calculate annotations for each station
+    # Calculate annotations for individual station view
     def get_annotations(temp_data, station_name):
         max_temp_idx = temp_data['max_temp'].idxmax()
         min_temp_idx = temp_data['min_temp'].idxmin()
@@ -277,15 +364,58 @@ if all_station_data:
             )
         ]
 
+    # Calculate annotations for comparison views (across all stations)
+    def get_comparison_annotations(temp_type='min_temp'):
+        # Find global min and max across all stations
+        global_min_val = float('inf')
+        global_max_val = float('-inf')
+        global_min_station = None
+        global_max_station = None
+        global_min_date = None
+        global_max_date = None
+
+        for station_id, temp_data in all_station_data.items():
+            station_name = KNMI_STATIONS[station_id]
+            min_idx = temp_data[temp_type].idxmin()
+            max_idx = temp_data[temp_type].idxmax()
+
+            if temp_data[temp_type][min_idx] < global_min_val:
+                global_min_val = temp_data[temp_type][min_idx]
+                global_min_station = station_name
+                global_min_date = temp_data['date'][min_idx]
+
+            if temp_data[temp_type][max_idx] > global_max_val:
+                global_max_val = temp_data[temp_type][max_idx]
+                global_max_station = station_name
+                global_max_date = temp_data['date'][max_idx]
+
+        return [
+            dict(
+                x=global_max_date,
+                y=global_max_val,
+                text=f"Highest: {global_max_val:.1f}°C ({global_max_station})",
+                showarrow=True,
+                arrowhead=1
+            ),
+            dict(
+                x=global_min_date,
+                y=global_min_val,
+                text=f"Lowest: {global_min_val:.1f}°C ({global_min_station})",
+                showarrow=True,
+                arrowhead=1
+            )
+        ]
+
     # === Station dropdown buttons (for individual view) ===
     station_buttons = []
     for i, station_id in enumerate(station_ids):
         station_name = KNMI_STATIONS[station_id]
         temp_data = all_station_data[station_id]
-        # Visibility: only this station's 2 traces, hide all comparison traces
+        # Visibility: all traces for this station (lines + markers)
         visibility = [False] * total_traces
-        visibility[i * 2] = True      # max temp trace
-        visibility[i * 2 + 1] = True  # min temp trace
+        start_idx = i * traces_per_station
+        for j in range(traces_per_station):
+            visibility[start_idx + j] = True
 
         station_buttons.append(dict(
             label=station_name,
@@ -303,8 +433,9 @@ if all_station_data:
     # Individual station view (default)
     default_idx = station_ids.index(default_station)
     individual_visibility = [False] * total_traces
-    individual_visibility[default_idx * 2] = True
-    individual_visibility[default_idx * 2 + 1] = True
+    start_idx = default_idx * traces_per_station
+    for j in range(traces_per_station):
+        individual_visibility[start_idx + j] = True
 
     # Comparison view - all min temps
     comparison_min_visibility = [False] * total_traces
@@ -364,7 +495,7 @@ if all_station_data:
                 {'visible': comparison_min_visibility},
                 {
                     'title': 'Minimum Temperature - All Stations',
-                    'annotations': [],
+                    'annotations': get_comparison_annotations('min_temp'),
                     'updatemenus[1].visible': False
                 }
             ]
@@ -376,7 +507,7 @@ if all_station_data:
                 {'visible': comparison_max_visibility},
                 {
                     'title': 'Maximum Temperature - All Stations',
-                    'annotations': [],
+                    'annotations': get_comparison_annotations('max_temp'),
                     'updatemenus[1].visible': False
                 }
             ]
@@ -434,8 +565,10 @@ if all_station_data:
             yanchor="top",
             y=0.99,
             xanchor="left",
-            x=0.15
-        )
+            x=1.02,
+            bgcolor="rgba(255,255,255,0.8)"
+        ),
+        margin=dict(r=150)
     )
 
     # Add a range slider
