@@ -15,9 +15,11 @@ load_dotenv()
 # Database connection parameters
 DB_CONFIG = {
     "host": os.getenv("DB_HOST", "localhost"),
+    "port": int(os.getenv("DB_PORT", 3306)),
     "user": os.getenv("DB_USER"),
     "password": os.getenv("DB_PASSWORD"),
-    "database": os.getenv("DB_DATABASE")
+    "database": os.getenv("DB_DATABASE"),
+    "ssl_disabled": os.getenv("DB_SSL_DISABLED", "False").lower() == "true"
 }
 
 # KNMI weather stations
