@@ -474,8 +474,13 @@ def update_stats(view_type, station_id, relayout_data):
     ])
 
 
+server = app.server  # Required for gunicorn
+
 if __name__ == '__main__':
+    port = int(os.getenv('PORT', 8050))
+    debug = os.getenv('DEBUG', 'True').lower() == 'true'
+
     print("\n" + "="*50)
-    print("Starting Dash app on http://localhost:8050")
+    print(f"Starting Dash app on http://localhost:{port}")
     print("="*50 + "\n")
-    app.run(debug=True, port=8050)
+    app.run(debug=debug, host='0.0.0.0', port=port)

@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: knmi-temperatuur
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn knmi:server
+    envVars:
+      - key: DEBUG
+        value: "False"
+      - key: DB_HOST
+        sync: false
+      - key: DB_USER
+        sync: false
+      - key: DB_PASSWORD
+        sync: false
+      - key: DB_DATABASE
+        sync: false
